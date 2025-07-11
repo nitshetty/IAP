@@ -10,6 +10,7 @@ from api.schemas import AgenticProductSearchIn, AgenticProductSearchOut
 from textblob import TextBlob
 from groq import Groq
 
+
 load_dotenv()
 API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")

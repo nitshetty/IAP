@@ -14,14 +14,15 @@ import re
 import json as pyjson
 from groq import Groq
 import base64
+import time
 
 router = APIRouter()
 
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+
 @router.post("/usecase/image-classification", response_model=List[ImageLabelOut])
-@AuthManager.check_access(
-    [RoleEnum.Admin, RoleEnum.Editor, RoleEnum.Viewer],
-    [LicenseEnum.Teams, LicenseEnum.Basic],
-)
+@AuthManager.check_access([RoleEnum.Admin, RoleEnum.Editor, RoleEnum.Viewer], [LicenseEnum.Teams, LicenseEnum.Basic])
 async def image_classification(
     file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -74,57 +75,82 @@ async def image_classification(
         image_path = f"data:image/jpeg;base64,{base64_image}"
 
         prompt = (
-            "What's in this image? Classify it as food/beverage/both/other. "
-            "Only return the classification as JSON list: "
-            "[{product_name: ..., category: food/beverage}]."
+            "Analyze the image and classify the products accurately. "
+            "Provide detailed classifications in JSON format: "
+            "[{product_name: ..., category: food/beverage/other}]. "
+            "Use external knowledge to ensure logical consistency."
         )
 
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": image_path}},
+        for attempt in range(MAX_RETRIES):
+            try:
+                chat_completion = client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": image_path}},
+                            ],
+                        }
                     ],
-                }
-            ],
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-        )
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                )
 
-        if not chat_completion or not chat_completion.choices:
-            raise HTTPException(status_code=500, detail="No response from vision model.")
+                if not chat_completion or not chat_completion.choices:
+                    print("Groq API did not return any choices.")
+                    raise HTTPException(status_code=500, detail="No response from vision model.")
 
-        content = chat_completion.choices[0].message.content
-        if not content:
-            raise HTTPException(status_code=500, detail="Empty content from vision model.")
+                content = chat_completion.choices[0].message.content
+                if not content:
+                    print("Groq API returned empty content.")
+                    raise HTTPException(status_code=500, detail="Empty content from vision model.")
 
-        match = re.search(r"\[.*?\]", content, re.DOTALL)
-        if not match:
-            raise HTTPException(status_code=500, detail="No valid JSON list found in model output.")
+                match = re.search(r"\[.*?\]", content, re.DOTALL)
+                if not match:
+                    print(f"Groq API response does not contain valid JSON: {content}")
+                    raise HTTPException(status_code=500, detail="No valid JSON list found in model output.")
 
-        try:
-            parsed = pyjson.loads(match.group(0))
-        except pyjson.JSONDecodeError as e:
-            raise HTTPException(status_code=500, detail=f"JSON parse failed: {str(e)}")
+                try:
+                    parsed = pyjson.loads(match.group(0))
+                except pyjson.JSONDecodeError as e:
+                    print(f"JSON parsing failed: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"JSON parse failed: {str(e)}")
 
-        if not isinstance(parsed, list):
-            raise HTTPException(status_code=500, detail="Parsed result is not a list.")
+                if not isinstance(parsed, list):
+                    print(f"Parsed result is not a list: {parsed}")
+                    raise HTTPException(status_code=500, detail="Parsed result is not a list.")
 
-        results = []
-        GENERIC_WORDS = {"plate", "table", "dish", "bowl", "utensil", "cutlery"}
-        for item in parsed:
-            product = item.get("product_name", "unknown").lower()
-            category = item.get("category", "unknown").lower()
-            if product == "string" or category == "string":
-                continue
-            if product not in GENERIC_WORDS:
-                results.append(ImageLabelOut(product_name=product, category=category))
+                results = []
+                for item in parsed:
+                    product = item.get("product_name", "unknown").lower()
+                    category = item.get("category", "unknown").lower()
+                    if product == "string" or category == "string":
+                        print(f"Skipping invalid product or category: {item}")
+                        continue
 
-        if results:
-            return results
+                    # Validate against database dynamically
+                    db_result = db.query(ImageLabel).filter(ImageLabel.product_name.ilike(f"%{product}%")).first()
+                    if db_result:
+                        category = db_result.category
+                    else:
+                        print(f"No database match found for product: {product}")
 
-        raise HTTPException(status_code=500, detail="No valid classification results found.")
+                    results.append(ImageLabelOut(product_name=product, category=category))
+
+                if results:
+                    return results
+
+                print("No valid classification results found.")
+                raise HTTPException(status_code=500, detail="No valid classification results found.")
+
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {str(e)}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                else:
+                    print("Max retries reached. Falling back to default response.")
+                    raise HTTPException(status_code=500, detail="Vision model failed after multiple attempts.")
 
     except Exception as e:
+        print(f"Unhandled exception: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

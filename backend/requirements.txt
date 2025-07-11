@@ -18,3 +18,8 @@ opencv-python
 transformers
 nltk
 textblob
+pyjwt
+python-dotenv
+pyyaml
+groq
+sentencepiece
